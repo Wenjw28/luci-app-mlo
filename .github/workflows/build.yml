@@ -1,0 +1,114 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DIST_NAME: luci-app-mlo
+
+jobs:
+  apk:
+    name: apk / ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          # 按需增减：只需要自己机型的话，删到只剩一行
+          - aarch64_cortex-a53   # MediaTek Filogic（Tenda BE12 Pro / 小米 AX3000T 等）
+          - aarch64_generic      # 其他 arm64（RK35xx 软路由等）
+          - x86_64               # x86 软路由
+          - mipsel_24kc          # 老 MT7621 等
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 读取版本
+        id: meta
+        run: echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: 语法检查
+        run: |
+          set -e
+          for f in files/usr/bin/mlo-toggle files/usr/bin/mlo-boot-guard \
+                   files/etc/init.d/mlo-guard scripts/build-apk.sh scripts/post-install.sh; do
+            sh -n "$f" && echo "ok  $f"
+          done
+          node scripts/smoke-test-view.js
+
+      - name: 构建 .apk
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          chmod +x scripts/build-apk.sh
+          sh scripts/build-apk.sh
+
+      - name: 校验产物
+        run: |
+          set -e
+          F="dist/luci-app-mlo-${{ steps.meta.outputs.version }}-${{ matrix.arch }}.apk"
+          ls -l dist/
+          test -s "$F"
+          # apk-tools v3 包的头 4 字节魔数 "ADBd"
+          magic=$(od -An -tx1 -N4 "$F" | tr -d ' \n')
+          if [ "$magic" != "41444264" ]; then
+            echo "::error::$F 不是 apk v3 包（magic=$magic）"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ matrix.arch }}
+          path: dist/*.apk
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: apk
+    # PR 不发布；push 到 main 更新滚动版 latest，打 v* tag 发正式版
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 列出产物
+        run: ls -l artifacts/
+
+      - name: 发布到 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # tag 触发 -> 用 tag 名；push 到 main -> 滚动更新的 "latest" 预发布
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || 'latest（滚动构建）' }}
+          prerelease: ${{ github.ref_type != 'tag' }}
+          overwrite_files: true
+          generate_release_notes: true
+          body: |
+            **安装（OpenWrt 25.12+ / apk）**
+
+            按设备架构选一个文件（`apk --print-arch` 查看，如 `aarch64_cortex-a53`）：
+
+            ```sh
+            apk add --allow-untrusted ./luci-app-mlo-<version>-<arch>.apk
+            ```
+
+            装完刷新 LuCI：**网络 → MLO 多链路**。
+            详见 [README](../blob/main/README.md)。
+          files: artifacts/*.apk

@@ -1,0 +1,244 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# mlo-lan-guard - 配置自愈守护（LAN 桥 + MLO 意图）
+#
+# 背景 1（LAN）：这套固件的 LuCI 没有 MLO 感知，在「网络 → 无线」页面保存时，
+#   会按"每个射频一个 network"的老逻辑把射频名写进 network.lan.device：
+#     正常: br-lan      被写坏: br-lan radio0 radio1.network1
+#   netifd 解析不了混合值 -> br-lan 不创建 -> lan3/4/5 全 DOWN -> 有线全掉。
+#
+# 背景 2（MLO）：同一个页面保存时，还会把多射频 wifi-iface 拆成单选并删掉
+#   mlo 选项：
+#     正常: device='radio0 radio1'  mlo='1'
+#     被改: device='radio0'          (mlo 被删)
+#   结果 MLO 静默消失，只剩单频 AP。
+#
+# 本守护记住"用户意图"（/etc/mlo/intent），配置一被改动就跟意图对账：
+#   - 意图是 MLO 开：把 device 补回全体射频、mlo 补回 1（保留用户新改的
+#     ssid/key/encryption 等其它字段）；
+#   - 意图是 MLO 关：不动无线结构。
+#   - 无论何时都把 network.lan.device 修回 br-lan。
+
+CONF_NET=/etc/config/network
+CONF_WL=/etc/config/wireless
+INTENT=/etc/mlo/intent
+LOG=/var/log/mlo.log
+STAMP=/tmp/mlo.guard.stamp
+PIDFILE=/var/run/mlo-lan-guard.pid
+POLL=15
+LAN_IFACE=lan
+WANT_DEV=br-lan
+
+log() { echo "$(date '+%F %T') [guard] $*" >> "$LOG" 2>/dev/null; }
+
+# ---- 单实例 ----
+if [ -f "$PIDFILE" ]; then
+	old=$(cat "$PIDFILE" 2>/dev/null)
+	if [ -n "$old" ] && [ "$old" != "$$" ] && kill -0 "$old" 2>/dev/null &&
+	   grep -q "mlo-lan-guard" "/proc/$old/cmdline" 2>/dev/null; then
+		log "another instance running (pid $old), exit"
+		exit 0
+	fi
+fi
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT
+
+# ---------------------------------------------------------------- LAN ----
+lan_ok() {
+	dev=$(uci -q get "network.$LAN_IFACE.device")
+	case "$dev" in
+		"$WANT_DEV"|"") return 0 ;;
+	esac
+	return 1
+}
+
+fix_lan() {
+	before=$(uci -q get "network.$LAN_IFACE.device")
+	log "lan.device '$before' -> '$WANT_DEV'"
+	uci -q set "network.$LAN_IFACE.device=$WANT_DEV"
+	return 0
+}
+
+# ---------------------------------------------------------------- MLO ----
+# 意图文件内容示例:
+#   mode=on
+#   iface=mlo0
+#   devs=radio0 radio1
+intent_mode() { sed -n 's/^mode=//p' "$INTENT" 2>/dev/null | head -1; }
+intent_iface() { sed -n 's/^iface=//p' "$INTENT" 2>/dev/null | head -1; }
+intent_devs() { sed -n 's/^devs=//p' "$INTENT" 2>/dev/null | head -1; }
+
+# 当前配置里有几个 mlo=1 的 wifi-iface
+cur_mld() {
+	for s in $(uci -q show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.=]*\)\.mode='ap'$/\1/p"); do
+		[ "$(uci -q get "wireless.$s.mlo")" = "1" ] && { echo "$s"; return; }
+	done
+}
+
+# 找"看起来像主 AP"的 iface（非 MLO、mode=ap、ssid 非空）
+cur_plain_ap() {
+	for s in $(uci -q show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.=]*\)\.mode='ap'$/\1/p"); do
+		[ "$(uci -q get "wireless.$s.mlo")" = "1" ] && continue
+		[ -n "$(uci -q get "wireless.$s.ssid")" ] || continue
+		# 排除插件自建的 ap_2g/ap_5g 之外的 IoT 也无妨，取第一个有 key 的
+		echo "$s"
+		return
+	done
+}
+
+mlo_ok() {
+	[ "$(intent_mode)" = "on" ] || return 0
+	c=$(cur_mld)
+	[ -n "$c" ] || return 1
+	dev=$(uci -q get "wireless.$c.device")
+	want=$(intent_devs)
+	[ "$dev" = "$want" ] || return 1
+	return 0
+}
+
+fix_mlo() {
+	iface=$(intent_iface)
+	devs=$(intent_devs)
+	[ -n "$iface" ] || iface=$(cur_mld)
+	[ -n "$iface" ] || iface=$(cur_plain_ap)
+	[ -n "$iface" ] || { log "mlo: no candidate iface"; return 1; }
+
+	cur_dev=$(uci -q get "wireless.$iface.device")
+	cur_mlo=$(uci -q get "wireless.$iface.mlo")
+
+	# 如果当前是另一个节被 LuCI 拆过，优先就地修复它
+	c=$(cur_mld)
+	if [ -n "$c" ]; then
+		iface=$c
+		cur_dev=$(uci -q get "wireless.$iface.device")
+	fi
+
+	changed=0
+	if [ "$cur_dev" != "$devs" ]; then
+		log "mlo: $iface.device '$cur_dev' -> '$devs'"
+		uci -q set "wireless.$iface.device=$devs"
+		changed=1
+	fi
+	if [ "$(uci -q get "wireless.$iface.mlo")" != "1" ]; then
+		log "mlo: $iface.mlo -> 1"
+		uci -q set "wireless.$iface.mlo=1"
+		changed=1
+	fi
+
+	# 若同时存在"被拆出来的单频同名 AP"，删掉避免重复 SSID
+	ssid=$(uci -q get "wireless.$iface.ssid")
+	for s in $(uci -q show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.=]*\)\.mode='ap'$/\1/p"); do
+		[ "$s" = "$iface" ] && continue
+		[ "$(uci -q get "wireless.$s.mlo")" = "1" ] && continue
+		[ "$(uci -q get "wireless.$s.ssid")" = "$ssid" ] || continue
+		log "mlo: remove duplicate single-band AP '$s'"
+		uci -q delete "wireless.$s"
+		changed=1
+	done
+
+	return $changed
+}
+
+record_intent() {
+	mkdir -p /etc/mlo
+	c=$(cur_mld)
+	if [ -n "$c" ]; then
+		{
+			echo "mode=on"
+			echo "iface=$c"
+			echo "devs=$(uci -q get "wireless.$c.device")"
+		} > "$INTENT"
+	else
+		echo "mode=off" > "$INTENT"
+	fi
+	log "intent recorded: $(tr '\n' ' ' < "$INTENT")"
+}
+
+# ------------------------------------------------------------ 对账 ----
+reconcile() {
+	need=0
+	lan_ok || { fix_lan; need=1; }
+	mlo_ok || { fix_mlo && need=1; }
+	[ "$need" = "1" ] || return 0
+
+	uci -q commit network
+	uci -q commit wireless
+	log "committed, restarting network"
+	/etc/init.d/network restart >/dev/null 2>&1
+	sleep 8
+	log "after reconcile: lan=$(uci -q get network.lan.device) mld=$(cur_mld) br=$(cat /sys/class/net/br-lan/operstate 2>/dev/null)"
+}
+
+# ---- 启动 ----
+sleep 25
+
+# 首次运行没有意图文件：按当前实际状态记录一次
+[ -f "$INTENT" ] || record_intent
+
+reconcile
+stamp_now() { ls -l "$CONF_NET" "$CONF_WL" 2>/dev/null | awk '{print $5"-"$6"-"$7"-"$8}' | tr '\n' '|'; }
+stamp_now > "$STAMP" 2>/dev/null
+
+# ---- 常驻 ----
+while :; do
+	sleep "$POLL"
+
+	# mlo-toggle 正在切换时（有 applying 标记），先不要插手，
+	# 否则会和它抢着改配置。
+	if [ -f /tmp/mlo.applying ]; then
+		stamp_now > "$STAMP" 2>/dev/null
+		continue
+	fi
+
+	# mlo-toggle 切换完成后会留下意图同步标记，这里消费掉并更新意图。
+	if [ -f /tmp/mlo.intent.sync ]; then
+		want=$(cat /tmp/mlo.intent.sync 2>/dev/null)
+		rm -f /tmp/mlo.intent.sync
+		case "$want" in
+			on)
+				if [ -n "$(cur_mld)" ]; then
+					record_intent
+					log "intent synced to on (from mlo-toggle)"
+				fi
+				;;
+			off)
+				mkdir -p /etc/mlo
+				echo "mode=off" > "$INTENT"
+				log "intent synced to off (from mlo-toggle)"
+				;;
+		esac
+		stamp_now > "$STAMP" 2>/dev/null
+		continue
+	fi
+
+	cur=$(stamp_now)
+	old=$(cat "$STAMP" 2>/dev/null)
+	[ "$cur" = "$old" ] && continue
+	echo "$cur" > "$STAMP"
+
+	# 等 uci 落盘稳定
+	sleep 3
+
+	# 用户通过 mlo-toggle 正经切换状态时，意图要跟着变，不能回滚回去。
+	# 判定：mlo-toggle 成功后会写 /tmp/mlo.intent.sync（含期望 mode）。
+	if [ -f /tmp/mlo.intent.sync ]; then
+		want=$(cat /tmp/mlo.intent.sync 2>/dev/null)
+		rm -f /tmp/mlo.intent.sync
+		case "$want" in
+			on)
+				if [ -n "$(cur_mld)" ]; then
+					record_intent
+					log "intent synced to on (from mlo-toggle)"
+				fi
+				;;
+			off)
+				echo "mode=off" > "$INTENT"
+				log "intent synced to off (from mlo-toggle)"
+				;;
+		esac
+		stamp_now > "$STAMP" 2>/dev/null
+		continue
+	fi
+
+	reconcile
+done

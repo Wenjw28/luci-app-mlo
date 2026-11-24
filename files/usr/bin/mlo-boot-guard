@@ -1,0 +1,32 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# mlo-boot-guard - 开机守护：如果冷启动后无线完全没起来，自动回退到
+# 开启 MLO 之前的那份配置并重启网络，避免开 MLO 后开不了机没 WiFi。
+#
+# 只在"一个无线接口都没有"时动作；MLD 正常起来（哪怕只有 1 条 link）不动。
+
+OFF_CONF=/etc/mlo/wireless.off
+LOG=/var/log/mlo.log
+
+log() { echo "$(date '+%F %T') [boot-guard] $*" >> "$LOG" 2>/dev/null; }
+
+# 给 DFS CAC（5GHz 常要 60s）留足时间
+sleep 150
+
+n=$(iw dev 2>/dev/null | grep -c 'Interface')
+if [ "$n" -gt 0 ]; then
+	log "boot ok, interfaces=$n"
+	exit 0
+fi
+
+if [ ! -f "$OFF_CONF" ]; then
+	log "no wifi interfaces and no backup, nothing to do"
+	exit 0
+fi
+
+log "no wifi interface after boot, restoring $OFF_CONF"
+cp "$OFF_CONF" /etc/config/wireless
+uci -q commit wireless
+/etc/init.d/network restart >/dev/null 2>&1
+sleep 20
+log "after restore interfaces=$(iw dev 2>/dev/null | grep -c 'Interface')"

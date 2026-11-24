@@ -1,0 +1,479 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# mlo-toggle - 一键开启/关闭 Wi-Fi 7 MLO（多链路聚合）
+#
+# 用法: mlo-toggle [status|enable|disable|toggle|restore]
+#
+# 开启: 把各频段的独立 AP 合并成一个 AP MLD（mlo=1）。SSID/密码不变，
+#       单链路设备仍用 WPA2 连接，Wi-Fi 7 设备自动走多链路。
+# 关闭: 拆回每个射频一个独立 AP，后台"无线"页面恢复成每个频段一个 SSID。
+#
+# 实现要点: 必须先把无线完全关掉（wifi down，等接口真的消失）再改配置、
+# 再 wifi up。在射频还开着的时候直接 reload/up 会撞上 mt7996e + hostapd 的
+# MLD 拆除竞态，netifd 会卡在 "Start pending MLD interfaces"，无线不恢复。
+#
+# 状态: /tmp/mlo.state   日志: /var/log/mlo.log   备份: /etc/mlo/wireless.off
+
+CONF=/etc/config/wireless
+STATE_DIR=/etc/mlo
+# 每次"开 MLO"时的配置快照（用于关闭时还原，会随开关注刷新）
+OFF_CONF=$STATE_DIR/wireless.off
+# 插件安装时的原始快照（只在首次生成，永不覆盖），用于"一键恢复出厂无线配置"
+ORIG_CONF=$STATE_DIR/wireless.orig
+INTENT_FILE=$STATE_DIR/intent
+LOG=/var/log/mlo.log
+STATE=/tmp/mlo.state
+PRE=/tmp/mlo.pre.conf
+APPLYING=/tmp/mlo.applying
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG" 2>/dev/null; }
+
+# 首次运行时留存原始快照，之后永不覆盖。
+# 正常由 apk post-install 在安装时生成；这里作为兜底（例如手动解压安装、
+# 或快照被误删的情况）。
+snapshot_orig() {
+	mkdir -p "$STATE_DIR"
+	[ -f "$ORIG_CONF" ] && return 0
+	cp "$CONF" "$ORIG_CONF" 2>/dev/null
+	log "original snapshot saved: $ORIG_CONF"
+}
+
+# ---------------------------------------------------------------- 查询 ----
+mlo_on() { uci -q show wireless 2>/dev/null | grep -q "\.mlo='1'"; }
+
+ap_ifaces() {
+	uci -q show wireless 2>/dev/null |
+		sed -n "s/^wireless\.\([^.=]*\)\.mode='ap'\$/\1/p"
+}
+
+mld_iface() {
+	for s in $(ap_ifaces); do
+		[ "$(uci -q get "wireless.$s.mlo")" = "1" ] && { echo "$s"; return; }
+	done
+}
+
+mld_dev() {
+	iw dev 2>/dev/null | awk '/Interface /{print $2}' | grep -m1 'mld'
+}
+
+mlo_radios() {
+	uci -q show wireless 2>/dev/null | while IFS= read -r line; do
+		case "$line" in
+			wireless.*.band=*)
+				s=${line#wireless.}; s=${s%%.band=*}
+				b=$(uci -q get "wireless.$s.band")
+				d=$(uci -q get "wireless.$s.disabled")
+				case "$b" in
+					2g|5g|6g) [ "$d" = "1" ] || echo "$s" ;;
+				esac
+				;;
+		esac
+	done
+}
+
+first_ap() { ap_ifaces | head -n 1; }
+
+# ---------------------------------------------------------------- 状态 ----
+iw_links() {
+	iw dev 2>/dev/null | awk '
+		function flush() { if (have) printf "%s %s %s\n", id, ch, w }
+		/- link ID/ {
+			flush();
+			id = ""; ch = ""; w = ""; have = 1;
+			for (i = 1; i <= NF; i++)
+				if ($i == "ID") { id = $(i + 1); break }
+			next;
+		}
+		have {
+			for (i = 1; i <= NF; i++) {
+				if ($i == "channel") ch = $(i + 1);
+				if ($i == "width:")  w = $(i + 1);
+			}
+		}
+		END { flush() }'
+}
+
+band_of_channel() {
+	c=$1
+	[ -z "$c" ] && { echo "?"; return; }
+	if [ "$c" -le 14 ] 2>/dev/null; then echo "2.4G"
+	elif [ "$c" -le 177 ] 2>/dev/null; then echo "5G"
+	else echo "6G"; fi
+}
+
+station_count() {
+	d=$(mld_dev)
+	[ -n "$d" ] || { echo 0; return; }
+	iw dev "$d" station dump 2>/dev/null | grep -c '^Station'
+}
+
+mlo_client_count() {
+	d=$(mld_dev)
+	[ -n "$d" ] || { echo 0; return; }
+	base="/sys/kernel/debug/ieee80211"
+	[ -d "$base" ] || mount -t debugfs none /sys/kernel/debug 2>/dev/null
+	n=0
+	for st in "$base"/*/netdev:"$d"/stations/*; do
+		[ -d "$st" ] || continue
+		[ -d "$st/link-0" ] && [ -d "$st/link-1" ] && n=$((n + 1))
+	done
+	echo "$n"
+}
+
+status_json() {
+	if [ -f "$APPLYING" ]; then
+		echo '{"state":"applying","msg":"正在重启无线…"}'
+		return
+	fi
+
+	if mlo_on; then
+		j=$(iw_links | while read -r id ch w; do
+			band=$(band_of_channel "$ch")
+			printf '%s{"id":%s,"channel":%s,"band":"%s","width":"%s"}' \
+					"$sep" "${id:-0}" "${ch:-0}" "$band" "$w"
+			sep=","
+		done)
+		echo "{\"state\":\"on\",\"links\":[$j],\"clients\":$(station_count),\"mlo_clients\":$(mlo_client_count)}"
+	else
+		n=$(iw dev 2>/dev/null | grep -c 'type AP')
+		echo "{\"state\":\"off\",\"aps\":$n,\"clients\":0,\"mlo_clients\":0}"
+	fi
+}
+
+# ------------------------------------------------------------ 无线开关 ----
+iface_count() { iw dev 2>/dev/null | grep -c 'Interface'; }
+
+# 必须重启整个 network 服务：只做 wifi down/up 或 wifi reload 时，
+# mt7996e + hostapd 在拆 MLD 时会留下脏状态（日志里 "remove link (1)
+# failed" 之后 netifd 只下发空配置），无线再也起不来。
+# /etc/init.d/network restart 会重启 netifd，从零重建无线，5 秒内恢复。
+network_restart() {
+	/etc/init.d/network restart >/dev/null 2>&1
+}
+
+verify() {
+	if [ "$1" = "on" ]; then
+		iw dev 2>/dev/null | grep -q 'MLD with links'
+	else
+		iw dev 2>/dev/null | grep -q 'MLD with links' && return 1
+		[ "$(iface_count)" -ge 1 ]
+	fi
+}
+
+# ------------------------------------------------------------ 配置改写 ----
+apply_enable() {
+	radios=$(mlo_radios)
+	devs=$(echo "$radios" | tr '\n' ' ' | sed 's/ *$//')
+	tmpl=$(first_ap)
+
+	ssid=$(uci -q get "wireless.$tmpl.ssid")
+	key=$(uci -q get "wireless.$tmpl.key")
+	enc=$(uci -q get "wireless.$tmpl.encryption")
+	net=$(uci -q get "wireless.$tmpl.network")
+	iso=$(uci -q get "wireless.$tmpl.isolate")
+	hid=$(uci -q get "wireless.$tmpl.hidden")
+
+	uci -q delete wireless.mlo0
+	uci set wireless.mlo0=wifi-iface
+	uci set wireless.mlo0.device="$devs"
+	uci set wireless.mlo0.mode='ap'
+	uci set wireless.mlo0.network="${net:-lan}"
+	uci set wireless.mlo0.ssid="$ssid"
+	uci set wireless.mlo0.encryption="${enc:-psk2}"
+	[ -n "$key" ] && uci set wireless.mlo0.key="$key"
+	[ -n "$iso" ] && uci set wireless.mlo0.isolate="$iso"
+	[ -n "$hid" ] && uci set wireless.mlo0.hidden="$hid"
+	uci set wireless.mlo0.mlo='1'
+	uci set wireless.mlo0.disabled='0'
+
+	# 只删"同频段、同 SSID、非 MLO"的旧 AP。
+	# 用户自己加的其它 SSID（如 IoT 专用 2.4G）不能动。
+	for s in $(ap_ifaces); do
+		[ "$s" = "mlo0" ] && continue
+		[ "$(uci -q get "wireless.$s.mlo")" = "1" ] && continue
+		[ "$(uci -q get "wireless.$s.ssid")" = "$ssid" ] || continue
+		uci -q delete "wireless.$s"
+	done
+	log "apply_enable devices=$devs ssid=$ssid"
+}
+
+apply_disable() {
+	mld=$(mld_iface)
+	ssid=$(uci -q get "wireless.$mld.ssid")
+	key=$(uci -q get "wireless.$mld.key")
+	enc=$(uci -q get "wireless.$mld.encryption")
+	net=$(uci -q get "wireless.$mld.network")
+	iso=$(uci -q get "wireless.$mld.isolate")
+	hid=$(uci -q get "wireless.$mld.hidden")
+
+	n=0
+	for r in $(mlo_radios); do
+		band=$(uci -q get "wireless.$r.band")
+		name="ap_$band"
+		uci -q delete "wireless.$name"
+		uci set "wireless.$name=wifi-iface"
+		uci set "wireless.$name.device=$r"
+		uci set "wireless.$name.mode='ap'"
+		uci set "wireless.$name.network=${net:-lan}"
+		uci set "wireless.$name.ssid=$ssid"
+		uci set "wireless.$name.encryption=${enc:-psk2}"
+		[ -n "$key" ] && uci set "wireless.$name.key=$key"
+		[ -n "$iso" ] && uci set "wireless.$name.isolate=$iso"
+		[ -n "$hid" ] && uci set "wireless.$name.hidden=$hid"
+		uci set "wireless.$name.disabled='0'"
+		n=$((n + 1))
+	done
+	uci -q delete "wireless.$mld"
+	# 其它自定义 SSID（IoT 等）保持不动
+	log "apply_disable split into $n APs"
+	[ "$n" -ge 1 ]
+}
+
+# ---------------------------------------------------------------- 执行 ----
+worker() {
+	target=$1
+	cp "$CONF" "$PRE"
+	log "worker start target=$target"
+
+	if [ "$target" = "on" ]; then
+		apply_enable
+	else
+		apply_disable
+	fi
+	uci -q commit wireless
+	network_restart
+
+	try=0
+	round=0
+	while [ $round -lt 2 ]; do
+		round=$((round + 1))
+		i=0
+		while [ $i -lt 20 ]; do
+			sleep 3
+			i=$((i + 1))
+			try=$((try + 1))
+			if verify "$target"; then
+				rm -f "$APPLYING"
+				# 告诉 mlo-lan-guard：这是用户主动切换，意图要跟着改，
+				# 不要把它当成"被 LuCI 改坏"回滚回去。
+				echo "$target" > /tmp/mlo.intent.sync 2>/dev/null
+				log "verify ok ($target) after ${try}x3s (iface=$(iface_count) mld=$(iw dev | grep -c 'MLD with links'))"
+				return 0
+			fi
+		done
+		log "round $round failed for $target, retrying network restart"
+		network_restart
+	done
+
+	log "verify FAILED ($target), rolling back"
+	if [ -f "$PRE" ]; then
+		cp "$PRE" "$CONF"
+		uci -q commit wireless
+		network_restart
+		sleep 15
+		log "rolled back, iface=$(iface_count)"
+	fi
+	rm -f "$APPLYING"
+	echo '{"state":"error","msg":"新配置未生效，已自动回滚"}'
+}
+
+do_enable() {
+	if mlo_on; then
+		echo '{"state":"on","msg":"MLO 已经是开启状态"}'
+		return 0
+	fi
+	if [ "$(mlo_radios | grep -c .)" -lt 2 ]; then
+		echo '{"state":"off","msg":"可用射频不足 2 个，无法启用 MLO"}'
+		return 1
+	fi
+	if [ -z "$(first_ap)" ]; then
+		echo '{"state":"off","msg":"找不到可用的 AP 配置"}'
+		return 1
+	fi
+
+	mkdir -p "$STATE_DIR"
+	# 首次开 MLO 时，当前这份就是"插件接管前"的原始配置，留存一份永不覆盖
+	snapshot_orig
+	cp "$CONF" "$OFF_CONF"
+	touch "$APPLYING"
+	setsid "$0" _worker on </dev/null >/dev/null 2>&1 &
+	echo '{"state":"applying","msg":"已提交，正在关闭并重新开启无线…"}'
+}
+
+do_disable() {
+	if ! mlo_on; then
+		echo '{"state":"off","msg":"MLO 已经是关闭状态"}'
+		return 0
+	fi
+	# 优先直接还原"开启 MLO 之前"那份配置（最可靠），
+	# 没有备份时才按当前 MLD 配置拆成每个射频一个 AP。
+	if [ -f "$OFF_CONF" ]; then
+		touch "$APPLYING"
+		setsid "$0" _restore </dev/null >/dev/null 2>&1 &
+		echo '{"state":"applying","msg":"正在关闭无线并恢复 2.4G / 5G 两个独立 AP…"}'
+		return 0
+	fi
+	touch "$APPLYING"
+	setsid "$0" _worker off </dev/null >/dev/null 2>&1 &
+	echo '{"state":"applying","msg":"已提交，正在关闭并重新开启无线…"}'
+}
+
+restore_worker() {
+	cp "$CONF" "$PRE"
+	log "restore from $OFF_CONF"
+
+	# 先记下当前配置里的自定义 AP（不是插件生成的 mlo0/ap_2g/ap_5g/ap_6g），
+	# 还原备份后再逐个补回去，避免把用户自己的 IoT SSID 抹掉。
+	CUSTOM=$(ap_ifaces | while read -r s; do
+		case "$s" in mlo0|ap_2g|ap_5g|ap_6g) continue ;; esac
+		[ "$(uci -q get "wireless.$s.mlo")" = "1" ] && continue
+		echo "$s"
+	done)
+
+	# 导出成 "uci set" 脚本（uci export 不能只导单节）
+	SAVE=/tmp/mlo.custom.uci
+	: > "$SAVE"
+	for s in $CUSTOM; do
+		uci -q show "wireless.$s" >> "$SAVE" 2>/dev/null
+	done
+
+	cp "$OFF_CONF" "$CONF"
+	uci -q commit wireless
+
+	# 补回自定义 SSID。
+	# 注意：uci show 输出形如  wireless.iot_2g.ssid='你的WiFi名_IoT'
+	# 直接 uci set "wireless.<原样>" 会因引号嵌套把值写成 '''xxx'''。
+	# 所以这里拆成 section.option 和原始值，用 uci set 的 key=value 形式，
+	# 值部分不带引号再交给 uci 自己加。
+	if [ -s "$SAVE" ]; then
+		for s in $CUSTOM; do
+			uci -q set "wireless.$s=wifi-iface"
+		done
+		while IFS= read -r line; do
+			# wireless.<sec>.<opt>='<val>'  ->  sec.opt 与 val
+			key=$(printf '%s' "$line" | sed -n "s/^wireless\.\([^.=]*\.[^=]*\)='.*'\$/\1/p")
+			val=$(printf '%s' "$line" | sed -n "s/^wireless\.[^.=]*\.[^=]*='\(.*\)'\$/\1/p")
+			[ -n "$key" ] && [ -n "$val" ] || continue
+			uci -q set "wireless.$key=$val"
+		done < "$SAVE"
+		uci -q commit wireless
+		log "restore: re-added custom vifs: $CUSTOM"
+	fi
+
+	network_restart
+
+	i=0
+	while [ $i -lt 20 ]; do
+		sleep 3
+		i=$((i + 1))
+		if verify off; then
+			rm -f "$APPLYING"
+			# 通知 mlo-lan-guard：用户主动关闭了 MLO，意图改成 off，
+			# 不要按旧意图把它开回来。
+			echo "off" > /tmp/mlo.intent.sync 2>/dev/null
+			log "restore ok after $((i * 3))s (iface=$(iface_count) mld=$(iw dev | grep -c 'MLD with links'))"
+			return 0
+		fi
+	done
+	log "restore FAILED, rolling back"
+	cp "$PRE" "$CONF"
+	uci -q commit wireless
+	network_restart
+	sleep 15
+	rm -f "$APPLYING"
+	echo '{"state":"error","msg":"恢复失败，已回滚"}'
+}
+
+restore_off() {
+	[ -f "$OFF_CONF" ] || { echo '{"state":"off","msg":"没有可用的备份"}'; return 1; }
+	touch "$APPLYING"
+	setsid "$0" _restore </dev/null >/dev/null 2>&1 &
+	echo '{"state":"applying","msg":"正在恢复安装前的无线配置…"}'
+}
+
+# ---------------------------------------------------------- 一键恢复 ----
+# 把无线配置还原成"插件接管前"的那份快照（wireless.orig），
+# 同时把 MLO 意图置为 off，并清空开关备份，避免守护又把 MLO 开回来。
+factory_config() {
+	if [ ! -f "$ORIG_CONF" ]; then
+		echo '{"state":"unknown","msg":"没有原始快照（插件是首次运行，请先开一次 MLO 生成快照）"}'
+		return 1
+	fi
+	touch "$APPLYING"
+	setsid "$0" _factory </dev/null >/dev/null 2>&1 &
+	echo '{"state":"applying","msg":"正在恢复插件安装前的无线配置…"}'
+}
+
+factory_worker() {
+	cp "$CONF" "$PRE"
+	log "factory reset from $ORIG_CONF"
+
+	# 记住当前自定义 SSID（IoT 等），恢复后补回
+	CUSTOM=$(ap_ifaces | while read -r s; do
+		case "$s" in mlo0|ap_2g|ap_5g|ap_6g) continue ;; esac
+		[ "$(uci -q get "wireless.$s.mlo")" = "1" ] && continue
+		echo "$s"
+	done)
+	SAVE=/tmp/mlo.factory.custom
+	: > "$SAVE"
+	for s in $CUSTOM; do uci -q show "wireless.$s" >> "$SAVE" 2>/dev/null; done
+
+	cp "$ORIG_CONF" "$CONF"
+	uci -q commit wireless
+
+	if [ -s "$SAVE" ]; then
+		for s in $CUSTOM; do uci -q set "wireless.$s=wifi-iface"; done
+		while IFS= read -r line; do
+			key=$(printf '%s' "$line" | sed -n "s/^wireless\.\([^.=]*\.[^=]*\)='.*'\$/\1/p")
+			val=$(printf '%s' "$line" | sed -n "s/^wireless\.[^.=]*\.[^=]*='\(.*\)'\$/\1/p")
+			[ -n "$key" ] && [ -n "$val" ] || continue
+			uci -q set "wireless.$key=$val"
+		done < "$SAVE"
+		uci -q commit wireless
+		log "factory: re-added custom vifs: $CUSTOM"
+	fi
+
+	# 意图置 off，避免 mlo-lan-guard 又按旧意图把 MLO 开回来
+	mkdir -p "$STATE_DIR"
+	echo "mode=off" > "$INTENT_FILE"
+	# 开关备份同步成这份配置，保证之后 disable 不会还原到坏状态
+	cp "$CONF" "$OFF_CONF" 2>/dev/null
+	rm -f /tmp/mlo.intent.sync
+
+	network_restart
+
+	i=0
+	while [ $i -lt 20 ]; do
+		sleep 3
+		i=$((i + 1))
+		if [ "$(iface_count)" -ge 1 ] && ! iw dev 2>/dev/null | grep -q 'MLD with links'; then
+			rm -f "$APPLYING"
+			log "factory ok after $((i * 3))s (iface=$(iface_count))"
+			return 0
+		fi
+	done
+
+	log "factory FAILED, rolling back"
+	cp "$PRE" "$CONF"
+	uci -q commit wireless
+	network_restart
+	sleep 15
+	rm -f "$APPLYING"
+	echo '{"state":"error","msg":"恢复失败，已回滚"}'
+}
+
+case "$1" in
+	status)  status_json ;;
+	enable)  do_enable ;;
+	disable) do_disable ;;
+	toggle)  if mlo_on; then do_disable; else do_enable; fi ;;
+	restore) restore_off ;;
+	factory) factory_config ;;
+	_worker)  worker "$2" ;;
+	_restore) restore_worker ;;
+	_factory) factory_worker ;;
+	*)
+		echo "用法: $0 [status|enable|disable|toggle|restore|factory]" >&2
+		exit 1
+		;;
+esac

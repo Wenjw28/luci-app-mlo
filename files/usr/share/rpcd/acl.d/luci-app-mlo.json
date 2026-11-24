@@ -1,0 +1,19 @@
+{
+	"luci-app-mlo": {
+		"description": "Grant access to MLO toggle",
+		"read": {
+			"file": {
+				"/usr/bin/mlo-toggle": [ "exec" ],
+				"/usr/bin/mlo-toggle *": [ "exec" ]
+			},
+			"uci": [ "wireless" ]
+		},
+		"write": {
+			"file": {
+				"/usr/bin/mlo-toggle": [ "exec" ],
+				"/usr/bin/mlo-toggle *": [ "exec" ]
+			},
+			"uci": [ "wireless" ]
+		}
+	}
+}

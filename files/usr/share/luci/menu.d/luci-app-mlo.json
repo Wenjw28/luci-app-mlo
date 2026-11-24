@@ -1,0 +1,14 @@
+{
+	"admin/network/mlo": {
+		"title": "MLO 多链路",
+		"order": 16,
+		"action": {
+			"type": "view",
+			"path": "mlo/panel"
+		},
+		"depends": {
+			"acl": [ "luci-app-mlo" ],
+			"uci": { "wireless": { "@wifi-device": true } }
+		}
+	}
+}
